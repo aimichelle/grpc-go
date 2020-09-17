@@ -58,21 +58,45 @@ func printFeature(client pb.RouteGuideClient, point *pb.Point) {
 // printFeatures lists all the features within the given bounding Rectangle.
 func printFeatures(client pb.RouteGuideClient, rect *pb.Rectangle) {
 	log.Printf("Looking for features within %v", rect)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = cancel
 	defer cancel()
+	defer func() {
+		log.Print("Stopping printFeatures")
+	}()
+
 	stream, err := client.ListFeatures(ctx, rect)
 	if err != nil {
-		log.Fatalf("%v.ListFeatures(_) = _, %v", client, err)
+		log.Print("%v.ListFeatures(_) = _, %v", client, err)
 	}
+
 	for {
-		feature, err := stream.Recv()
-		if err == io.EOF {
-			break
+		select {
+		case <-stream.Context().Done():
+			return
+		case <-ctx.Done():
+			return
+		default:
+			_, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				// Received error, starting new stream after waiting for some time.
+				log.Print("%v.ListFeatures(_) = _, %v", client, err)
+				cancel()
+				
+				time.Sleep(5 * time.Second)
+				log.Print("Restarting ListFeatures stream")
+				ctx, cancel = context.WithCancel(context.Background())
+				stream, err = client.ListFeatures(ctx, rect)
+				if err != nil {
+					log.Print("%v.ListFeatures(_) = _, %v", client, err)
+				}			
+			}
+			log.Println("Received something from the stream")
 		}
-		if err != nil {
-			log.Fatalf("%v.ListFeatures(_) = _, %v", client, err)
-		}
-		log.Println(feature)
 	}
 }
 
@@ -167,18 +191,20 @@ func main() {
 	}
 
 	opts = append(opts, grpc.WithBlock())
-	conn, err := grpc.Dial(*serverAddr, opts...)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, *serverAddr, opts...)
 	if err != nil {
 		log.Fatalf("fail to dial: %v", err)
 	}
 	defer conn.Close()
 	client := pb.NewRouteGuideClient(conn)
-
+	
 	// Looking for a valid feature
-	printFeature(client, &pb.Point{Latitude: 409146138, Longitude: -746188906})
+	// printFeature(client, &pb.Point{Latitude: 409146138, Longitude: -746188906})
 
-	// Feature missing.
-	printFeature(client, &pb.Point{Latitude: 0, Longitude: 0})
+	// // Feature missing.
+	// printFeature(client, &pb.Point{Latitude: 0, Longitude: 0})
 
 	// Looking for features between 40, -75 and 42, -73.
 	printFeatures(client, &pb.Rectangle{
@@ -187,8 +213,9 @@ func main() {
 	})
 
 	// RecordRoute
-	runRecordRoute(client)
+	// runRecordRoute(client)
 
-	// RouteChat
-	runRouteChat(client)
+	// // RouteChat
+	// runRouteChat(client)
 }
+

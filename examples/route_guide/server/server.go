@@ -16,8 +16,6 @@
  *
  */
 
-//go:generate protoc -I ../routeguide --go_out=plugins=grpc:../routeguide ../routeguide/route_guide.proto
-
 // Package main implements a simple gRPC server that demonstrates how to use gRPC-Go libraries
 // to perform unary, client streaming, server streaming and full duplex RPCs.
 //
@@ -25,65 +23,77 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"flag"
-	"fmt"
-	"io"
-	"io/ioutil"
-	"log"
-	"math"
-	"net"
-	"sync"
-	"time"
+    "context"
+    "encoding/json"
+    "flag"
+    "fmt"
+    "io"
+    "io/ioutil"
+    "log"
+    "math"
+    "net"
+    "sync"
+    "time"
+    "google.golang.org/grpc"
 
-	"google.golang.org/grpc"
+    "google.golang.org/grpc/testdata"
 
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/testdata"
+    "github.com/golang/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
+    pb "google.golang.org/grpc/examples/route_guide/routeguide"
 
-	pb "google.golang.org/grpc/examples/route_guide/routeguide"
+    "golang.org/x/net/http2"
+    "golang.org/x/net/http2/h2c"
+    "net/http"
+    "strings"
+    tls2 "crypto/tls"
 )
 
 var (
-	tls        = flag.Bool("tls", false, "Connection uses TLS if true, else plain TCP")
-	certFile   = flag.String("cert_file", "", "The TLS cert file")
-	keyFile    = flag.String("key_file", "", "The TLS key file")
-	jsonDBFile = flag.String("json_db_file", "", "A json file containing a list of features")
-	port       = flag.Int("port", 10000, "The server port")
+    tls        = flag.Bool("tls", false, "Connection uses TLS if true, else plain TCP")
+    certFile   = flag.String("cert_file", "", "The TLS cert file")
+    keyFile    = flag.String("key_file", "", "The TLS key file")
+    jsonDBFile = flag.String("json_db_file", "", "A json file containing a list of features")
+    port       = flag.Int("port", 10000, "The server port")
 )
 
 type routeGuideServer struct {
-	pb.UnimplementedRouteGuideServer
-	savedFeatures []*pb.Feature // read-only after initialized
+    pb.UnimplementedRouteGuideServer
+    savedFeatures []*pb.Feature // read-only after initialized
 
-	mu         sync.Mutex // protects routeNotes
-	routeNotes map[string][]*pb.RouteNote
+    mu         sync.Mutex // protects routeNotes
+    routeNotes map[string][]*pb.RouteNote
 }
 
 // GetFeature returns the feature at the given point.
 func (s *routeGuideServer) GetFeature(ctx context.Context, point *pb.Point) (*pb.Feature, error) {
-	for _, feature := range s.savedFeatures {
-		if proto.Equal(feature.Location, point) {
-			return feature, nil
-		}
-	}
-	// No feature was found, return an unnamed feature
-	return &pb.Feature{Location: point}, nil
+    for _, feature := range s.savedFeatures {
+        if proto.Equal(feature.Location, point) {
+            return feature, nil
+        }
+    }
+    // No feature was found, return an unnamed feature
+    return &pb.Feature{Location: point}, nil
 }
 
-// ListFeatures lists all features contained within the given bounding Rectangle.
+    // ListFeatures lists all features contained within the given bounding Rectangle.
 func (s *routeGuideServer) ListFeatures(rect *pb.Rectangle, stream pb.RouteGuide_ListFeaturesServer) error {
-	for _, feature := range s.savedFeatures {
-		if inRange(feature.Location, rect) {
-			if err := stream.Send(feature); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+    // This is a stream that should keep sending until HTTP2 timeout.
+    log.Print("List features stream started")
+    for {
+        select {
+        case <-stream.Context().Done():
+            log.Print("ListFeatures context closed")
+            return nil
+        default:
+            // Just repeatedly send the same feature for now.
+             if err := stream.Send(s.savedFeatures[0]); err != nil {
+                 return err
+             }
+            time.Sleep(2 * time.Second)
+        }
+    }
+    return nil
 }
 
 // RecordRoute records a route composited of a sequence of points.
@@ -92,156 +102,191 @@ func (s *routeGuideServer) ListFeatures(rect *pb.Rectangle, stream pb.RouteGuide
 // number of points,  number of known features visited, total distance traveled, and
 // total time spent.
 func (s *routeGuideServer) RecordRoute(stream pb.RouteGuide_RecordRouteServer) error {
-	var pointCount, featureCount, distance int32
-	var lastPoint *pb.Point
-	startTime := time.Now()
-	for {
-		point, err := stream.Recv()
-		if err == io.EOF {
-			endTime := time.Now()
-			return stream.SendAndClose(&pb.RouteSummary{
-				PointCount:   pointCount,
-				FeatureCount: featureCount,
-				Distance:     distance,
-				ElapsedTime:  int32(endTime.Sub(startTime).Seconds()),
-			})
-		}
-		if err != nil {
-			return err
-		}
-		pointCount++
-		for _, feature := range s.savedFeatures {
-			if proto.Equal(feature.Location, point) {
-				featureCount++
-			}
-		}
-		if lastPoint != nil {
-			distance += calcDistance(lastPoint, point)
-		}
-		lastPoint = point
-	}
+    var pointCount, featureCount, distance int32
+    var lastPoint *pb.Point
+    startTime := time.Now()
+    for {
+        point, err := stream.Recv()
+        if err == io.EOF {
+            endTime := time.Now()
+            return stream.SendAndClose(&pb.RouteSummary{
+                PointCount:   pointCount,
+                FeatureCount: featureCount,
+                Distance:     distance,
+                ElapsedTime:  int32(endTime.Sub(startTime).Seconds()),
+            })
+        }
+        if err != nil {
+            return err
+        }
+        pointCount++
+        for _, feature := range s.savedFeatures {
+            if proto.Equal(feature.Location, point) {
+                featureCount++
+            }
+        }
+        if lastPoint != nil {
+            distance += calcDistance(lastPoint, point)
+        }
+        lastPoint = point
+    }
 }
 
 // RouteChat receives a stream of message/location pairs, and responds with a stream of all
 // previous messages at each of those locations.
 func (s *routeGuideServer) RouteChat(stream pb.RouteGuide_RouteChatServer) error {
-	for {
-		in, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		key := serialize(in.Location)
+    for {
+        in, err := stream.Recv()
+        if err == io.EOF {
+            return nil
+        }
+        if err != nil {
+            return err
+        }
+        key := serialize(in.Location)
 
-		s.mu.Lock()
-		s.routeNotes[key] = append(s.routeNotes[key], in)
-		// Note: this copy prevents blocking other clients while serving this one.
-		// We don't need to do a deep copy, because elements in the slice are
-		// insert-only and never modified.
-		rn := make([]*pb.RouteNote, len(s.routeNotes[key]))
-		copy(rn, s.routeNotes[key])
-		s.mu.Unlock()
+        s.mu.Lock()
+        s.routeNotes[key] = append(s.routeNotes[key], in)
+        // Note: this copy prevents blocking other clients while serving this one.
+        // We don't need to do a deep copy, because elements in the slice are
+        // insert-only and never modified.
+        rn := make([]*pb.RouteNote, len(s.routeNotes[key]))
+        copy(rn, s.routeNotes[key])
+        s.mu.Unlock()
 
-		for _, note := range rn {
-			if err := stream.Send(note); err != nil {
-				return err
-			}
-		}
-	}
+        for _, note := range rn {
+            if err := stream.Send(note); err != nil {
+                return err
+            }
+        }
+    }
 }
 
 // loadFeatures loads features from a JSON file.
 func (s *routeGuideServer) loadFeatures(filePath string) {
-	var data []byte
-	if filePath != "" {
-		var err error
-		data, err = ioutil.ReadFile(filePath)
-		if err != nil {
-			log.Fatalf("Failed to load default features: %v", err)
-		}
-	} else {
-		data = exampleData
-	}
-	if err := json.Unmarshal(data, &s.savedFeatures); err != nil {
-		log.Fatalf("Failed to load default features: %v", err)
-	}
+    var data []byte
+    if filePath != "" {
+        var err error
+        data, err = ioutil.ReadFile(filePath)
+        if err != nil {
+            log.Fatalf("Failed to load default features: %v", err)
+        }
+    } else {
+        data = exampleData
+    }
+    if err := json.Unmarshal(data, &s.savedFeatures); err != nil {
+        log.Fatalf("Failed to load default features: %v", err)
+    }
 }
 
 func toRadians(num float64) float64 {
-	return num * math.Pi / float64(180)
+    return num * math.Pi / float64(180)
 }
 
 // calcDistance calculates the distance between two points using the "haversine" formula.
 // The formula is based on http://mathforum.org/library/drmath/view/51879.html.
 func calcDistance(p1 *pb.Point, p2 *pb.Point) int32 {
-	const CordFactor float64 = 1e7
-	const R = float64(6371000) // earth radius in metres
-	lat1 := toRadians(float64(p1.Latitude) / CordFactor)
-	lat2 := toRadians(float64(p2.Latitude) / CordFactor)
-	lng1 := toRadians(float64(p1.Longitude) / CordFactor)
-	lng2 := toRadians(float64(p2.Longitude) / CordFactor)
-	dlat := lat2 - lat1
-	dlng := lng2 - lng1
+    const CordFactor float64 = 1e7
+    const R = float64(6371000) // earth radius in metres
+    lat1 := toRadians(float64(p1.Latitude) / CordFactor)
+    lat2 := toRadians(float64(p2.Latitude) / CordFactor)
+    lng1 := toRadians(float64(p1.Longitude) / CordFactor)
+    lng2 := toRadians(float64(p2.Longitude) / CordFactor)
+    dlat := lat2 - lat1
+    dlng := lng2 - lng1
 
-	a := math.Sin(dlat/2)*math.Sin(dlat/2) +
-		math.Cos(lat1)*math.Cos(lat2)*
-			math.Sin(dlng/2)*math.Sin(dlng/2)
-	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+    a := math.Sin(dlat/2)*math.Sin(dlat/2) +
+        math.Cos(lat1)*math.Cos(lat2)*
+            math.Sin(dlng/2)*math.Sin(dlng/2)
+    c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 
-	distance := R * c
-	return int32(distance)
+    distance := R * c
+    return int32(distance)
 }
 
 func inRange(point *pb.Point, rect *pb.Rectangle) bool {
-	left := math.Min(float64(rect.Lo.Longitude), float64(rect.Hi.Longitude))
-	right := math.Max(float64(rect.Lo.Longitude), float64(rect.Hi.Longitude))
-	top := math.Max(float64(rect.Lo.Latitude), float64(rect.Hi.Latitude))
-	bottom := math.Min(float64(rect.Lo.Latitude), float64(rect.Hi.Latitude))
+    left := math.Min(float64(rect.Lo.Longitude), float64(rect.Hi.Longitude))
+    right := math.Max(float64(rect.Lo.Longitude), float64(rect.Hi.Longitude))
+    top := math.Max(float64(rect.Lo.Latitude), float64(rect.Hi.Latitude))
+    bottom := math.Min(float64(rect.Lo.Latitude), float64(rect.Hi.Latitude))
 
-	if float64(point.Longitude) >= left &&
-		float64(point.Longitude) <= right &&
-		float64(point.Latitude) >= bottom &&
-		float64(point.Latitude) <= top {
-		return true
-	}
-	return false
+    if float64(point.Longitude) >= left &&
+        float64(point.Longitude) <= right &&
+        float64(point.Latitude) >= bottom &&
+        float64(point.Latitude) <= top {
+        return true
+    }
+    return false
 }
 
 func serialize(point *pb.Point) string {
-	return fmt.Sprintf("%d %d", point.Latitude, point.Longitude)
+    return fmt.Sprintf("%d %d", point.Latitude, point.Longitude)
 }
 
 func newServer() *routeGuideServer {
-	s := &routeGuideServer{routeNotes: make(map[string][]*pb.RouteNote)}
-	s.loadFeatures(*jsonDBFile)
-	return s
+    s := &routeGuideServer{routeNotes: make(map[string][]*pb.RouteNote)}
+    s.loadFeatures(*jsonDBFile)
+    return s
+}
+
+
+func isGRPCRequest(r *http.Request) bool {
+    return r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
 }
 
 func main() {
-	flag.Parse()
-	lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", *port))
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
-	}
-	var opts []grpc.ServerOption
-	if *tls {
-		if *certFile == "" {
-			*certFile = testdata.Path("server1.pem")
-		}
-		if *keyFile == "" {
-			*keyFile = testdata.Path("server1.key")
-		}
-		creds, err := credentials.NewServerTLSFromFile(*certFile, *keyFile)
-		if err != nil {
-			log.Fatalf("Failed to generate credentials %v", err)
-		}
-		opts = []grpc.ServerOption{grpc.Creds(creds)}
-	}
-	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterRouteGuideServer(grpcServer, newServer())
-	grpcServer.Serve(lis)
+    flag.Parse()
+    lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", *port))
+    if err != nil {
+        log.Fatalf("failed to listen: %v", err)
+    }
+    var opts []grpc.ServerOption
+    grpcServer := grpc.NewServer(opts...)
+    pb.RegisterRouteGuideServer(grpcServer, newServer())
+
+    // We will serve with an http2 server.
+    // grpcServer.Serve(lis)
+    mux := http.NewServeMux()
+
+    muxHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Normally other handlers will go in here, and are chosen based on the contents 
+        // of the request. For now, we just want GRPC.
+        if isGRPCRequest(r) {
+          grpcServer.ServeHTTP(w, r)
+          return           
+        }
+        mux.ServeHTTP(w, r)
+    })
+    
+    var tlsConfig *tls2.Config
+    if *tls {
+        pair, err := tls2.LoadX509KeyPair( testdata.Path("server1.pem"), testdata.Path("server1.key"))
+        if err != nil {
+            log.Fatalf("failed to load keys: %s", err.Error())
+        }
+        tlsConfig = &tls2.Config{
+            Certificates: []tls2.Certificate{pair},
+            NextProtos:   []string{"h2"},
+        }
+        lis = tls2.NewListener(lis, tlsConfig)
+
+    }
+
+    httpServer := &http.Server{
+        Addr:           fmt.Sprintf("localhost:%d", *port),
+        Handler:        h2c.NewHandler(muxHandler, &http2.Server{}),
+        TLSConfig:      tlsConfig,
+        ReadTimeout:    10 * time.Second,
+        WriteTimeout:   10 * time.Second,
+        MaxHeaderBytes: 1 << 20,
+    }
+    
+    if err := httpServer.Serve(lis); err != nil {
+        // Check for graceful termination.
+        if err != http.ErrServerClosed {
+            log.Fatalf("Failed to run GRPC server")
+        }
+    }
 }
 
 // exampleData is a copy of testdata/route_guide_db.json. It's to avoid
@@ -847,3 +892,4 @@ var exampleData = []byte(`[{
     },
     "name": "3 Hasta Way, Newton, NJ 07860, USA"
 }]`)
+
